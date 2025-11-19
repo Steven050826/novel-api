@@ -1,114 +1,128 @@
 # biqu_core.py
 import os
 import time
+import urllib.parse
+import copy
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-BASE_URL = "https://www.qu02.cc"
+# ========== 完全复制自 biqu.py 的配置 ==========
+BASE_URL = "https://www.qu02.cc/"
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+    "authority": "www.biqg.cc",
+    "accept": "application/json",
+    "accept-language": "zh,en;q=0.9,zh-CN;q=0.8",
+    "cache-control": "no-cache",
+    "pragma": "no-cache",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+    "x-requested-with": "XMLHttpRequest",
 }
 
+# ========== 核心类（精简版，移除终端交互） ==========
 class NovelDownloader:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
 
-    def search(self, keyword):
-        """搜索小说，返回结果列表"""
+    def get_hm_cookie(self, url):
         try:
-            params = {"s": quote(keyword)}
-            response = self.session.get(f"{BASE_URL}/search.html", params=params, timeout=10)
-            response.encoding = 'utf-8'
-            soup = BeautifulSoup(response.text, 'html.parser')
-            results = []
-            for item in soup.select('.novelslist2 li'):
-                link = item.select_one('a')
-                if not link or not link.get('href'):
-                    continue
-                title_elem = item.select_one('.s2 a')
-                author_elem = item.select_one('.s4')
-                if not title_elem or not author_elem:
-                    continue
-                results.append({
-                    "articlename": title_elem.get_text(strip=True),
-                    "author": author_elem.get_text(strip=True),
-                    "url_list": link['href']
-                })
-            return results
-        except Exception as e:
-            return []
+            self.session.get(url=url, timeout=10)
+            return True
+        except requests.RequestException:
+            return False
 
-    def get_chapter_list(self, novel_url):
-        """获取章节列表"""
+    def search(self, key_word):
+        new_header = copy.deepcopy(HEADERS)
+        new_header["referer"] = urllib.parse.quote(f"{BASE_URL}/s?q={key_word}", safe="/&=:?")
+        hm_url = urllib.parse.quote(f"{BASE_URL}/user/hm.html?q={key_word}", safe="/&=:?")
+        if not self.get_hm_cookie(hm_url):
+            return []
+        params = {"q": key_word}
         try:
-            response = self.session.get(novel_url, timeout=10)
-            response.encoding = 'utf-8'
-            soup = BeautifulSoup(response.text, 'html.parser')
-            chapters = []
-            for a in soup.select('#list dl dd a'):
-                href = a.get('href')
-                title = a.get_text(strip=True)
-                if href and title:
-                    full_url = urljoin(novel_url, href)
-                    chapters.append((title, full_url))
-            return chapters
+            response = self.session.get(
+                f"{BASE_URL}/user/search.html",
+                params=params,
+                headers=new_header,
+                timeout=10,
+            )
+            return response.json()
         except Exception:
             return []
 
-    def fetch_chapter_content(self, title, url):
-        """获取单章内容（纯文本）"""
+    def download_chapter(self, args):
+        tag, href, index = args
+        title = tag.text.strip()
+        url = f"{BASE_URL}{href}"
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, timeout=10)
+                soup = BeautifulSoup(response.content, "html.parser")
+                text = soup.find(id="chaptercontent")
+                if not text:
+                    raise ValueError("未找到章节内容")
+                content = [f"\n\n{title}\n\n"]
+                # ⚠️ 完全保留原逻辑：split(" ")[1:-2]
+                content.extend(f"{i}\n" for i in text.get_text().split(" ")[1:-2])
+                return index, title, "".join(content)
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    return index, title, f"\n\n{title}\n\n下载失败: {str(e)}\n\n"
+                time.sleep(1)
+        return index, title, f"\n\n{title}\n\n下载失败\n\n"
+
+    def download_novel_to_text(self, url, novel_name, author):
         try:
             response = self.session.get(url, timeout=10)
-            response.encoding = 'utf-8'
-            soup = BeautifulSoup(response.text, 'html.parser')
-            content_div = soup.select_one('#content')
-            if content_div:
-                for ad in content_div.select('div'):
-                    ad.decompose()
-                text = content_div.get_text(strip=False)
-                text = "\n".join(line.strip() for line in text.split("\n") if line.strip())
-                return f"\n\n{title}\n\n{text}\n"
-        except Exception:
-            pass
-        return f"\n\n{title}\n\n[下载失败]\n"
+            soup = BeautifulSoup(response.content, "html.parser")
+            chapters = []
+            index = 0
+            # ========== 完全复制章节收集逻辑 ==========
+            for tag in soup.select("div[class='listmain'] dl dd a"):
+                href = tag["href"]
+                if href == "javascript:dd_show()":
+                    for hide_tag in soup.select("span[class='dd_hide'] dd a"):
+                        chapters.append((hide_tag, hide_tag["href"], index))
+                        index += 1
+                else:
+                    chapters.append((tag, href, index))
+                    index += 1
 
-    def download_novel_to_text(self, novel_url, title, author):
-        """下载整本小说为字符串（不保存文件）"""
-        chapters = self.get_chapter_list(novel_url)
-        if not chapters:
-            return False, "未找到章节", ""
+            if not chapters:
+                return False, "未找到章节", ""
 
-        output = f"书名：{title}\n作者：{author}\n来源：{novel_url}\n\n"
+            chapter_contents = {}
+            max_workers = min(20, len(chapters))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_chapter = {
+                    executor.submit(self.download_chapter, args): args
+                    for args in chapters
+                }
+                for future in as_completed(future_to_chapter):
+                    index, title, content = future.result()
+                    if index is not None:
+                        chapter_contents[index] = content
 
-        # 并发下载（限制线程数）
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            future_to_title = {
-                executor.submit(self.fetch_chapter_content, title, url): title
-                for title, url in chapters
-            }
-            results = {}
-            for future in as_completed(future_to_title):
-                title = future_to_title[future]
-                try:
-                    content = future.result()
-                    results[title] = content
-                except Exception:
-                    results[title] = f"\n\n{title}\n\n[解析异常]\n"
+            # ========== 拼接顺序完全一致 ==========
+            output_lines = [f"《{novel_name}》\n作者：{author}\n\n"]
+            for i in range(len(chapter_contents)):
+                output_lines.append(chapter_contents[i])
+            return True, "成功", "".join(output_lines)
 
-        # 按原始顺序拼接
-        for title, _ in chapters:
-            output += results.get(title, f"\n\n{title}\n\n[内容丢失]\n")
+        except Exception as e:
+            return False, str(e), ""
 
-        return True, "成功", output
-
-
-# 暴露函数
+# ========== 暴露给 app.py 的接口 ==========
 def search_novels(keyword):
     downloader = NovelDownloader()
-    return downloader.search(keyword)
+    raw_results = downloader.search(keyword)
+    # biqu.py 的 search 返回的是 list[dict]，直接返回即可
+    return raw_results
 
 def download_novel_to_text(novel_url, title, author):
     downloader = NovelDownloader()
