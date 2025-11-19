@@ -1,10 +1,16 @@
 # app.py
+import os
 from flask import Flask, request, jsonify
 from biqu_core import search_novels, download_novel_to_text
 from urllib.parse import urljoin
 
 app = Flask(__name__)
 BASE_URL = "https://www.qu02.cc"
+
+# === 关键：让 jsonify 输出中文不转义 ===
+app.config['JSON_AS_ASCII'] = False
+# Flask 2.3+ 推荐方式（向下兼容）
+app.json.ensure_ascii = False
 
 @app.route("/search")
 def search():
@@ -53,4 +59,5 @@ def hello():
     return "笔趣阁小说 API 正常运行！\nEndpoints: /search?q=... , /download?url=...&title=...&author=..."
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port)
